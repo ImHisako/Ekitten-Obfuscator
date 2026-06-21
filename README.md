@@ -2,7 +2,7 @@
 
 Ekitten Final è un obfuscator Python a file singolo, progettato con un approccio **compatibility-first**. Trasforma in modo conservativo il sorgente quando il profilo lo permette, comprime il risultato e lo protegge con più round autenticati del cifrario sperimentale BlazingOpossum presente nel repository.
 
-Il progetto non usa AES. Il loader generato dipende esclusivamente dalla libreria standard Python e contiene un port memory-safe dello schema MARX-P/CTR di `Python Obfuscators/BlazingOpossum-main`.
+Il progetto non usa AES. Il loader generato dipende esclusivamente dalla libreria standard Python e contiene un port memory-safe dello schema MARX-P/CTR di `BlazingOpossum`.
 
 > L’obfuscation aumenta costo e tempo necessari per analizzare un programma, ma non rende il codice “impossibile da recuperare”. Un programma Python autonomo deve contenere codice, dati e materiale necessario all’esecuzione: un analista che controlla il runtime può quindi osservare il payload dopo la decodifica.
 
