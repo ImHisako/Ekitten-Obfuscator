@@ -1,4 +1,4 @@
-"""Ekitten Final differential compatibility fixture.
+"""Ekitten Obfuscator differential compatibility fixture.
 
 Run this file directly before and after obfuscation.  A successful execution
 prints one deterministic JSON line; any compatibility regression raises an
@@ -481,7 +481,10 @@ def main() -> int:
     if unknown_arguments:
         raise SystemExit("Unknown test arguments: " + ", ".join(sorted(unknown_arguments)))
     summary = run_compatibility_suite(
-        check_docstring="--allow-stripped-docstrings" not in sys.argv[1:]
+        check_docstring=(
+            __doc__ is not None
+            and "--allow-stripped-docstrings" not in sys.argv[1:]
+        )
     )
     print(json.dumps(summary, sort_keys=True))
     return 0
