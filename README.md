@@ -1,5 +1,9 @@
 # Ekitten Final
 
+<p align="center">
+<img src="https://i.pinimg.com/736x/8c/15/11/8c15118889f9bcd55da90fd78f025985.jpg", width="500", height="500">
+</p>
+
 Ekitten Final è un obfuscator Python a file singolo, progettato con un approccio **compatibility-first**. Trasforma in modo conservativo il sorgente quando il profilo lo permette, comprime il risultato e lo protegge con più round autenticati del cifrario sperimentale BlazingOpossum presente nel repository.
 
 Il progetto non usa AES. Il loader generato dipende esclusivamente dalla libreria standard Python e contiene un port memory-safe dello schema MARX-P/CTR di `BlazingOpossum`.
@@ -13,8 +17,9 @@ Il progetto non usa AES. Il loader generato dipende esclusivamente dalla libreri
 - Tag di integrità verificato prima di decifrare ogni round.
 - `IntObfuscator` AST polimorfico con sei strategie aritmetiche e bitwise.
 - `StringObfuscator` UTF-8 polimorfico con sei strategie byte-safe.
-- Rinomina selettiva delle variabili locali nei soli scope considerati sicuri.
-- Compressione del payload con `zlib`.
+- Decodifica lazy delle stringhe al punto d'uso, con azzeramento best-effort dei buffer temporanei mutabili.
+- Rinomina scope-aware delle variabili locali nei soli scope considerati sicuri, con skip conservativo per reflection, closure ambigue, `global`, `nonlocal`, pickle e API pubbliche.
+- Pipeline sorgente a pass atomiche: ogni pass viene compilata dopo l'applicazione e viene ripristinata se fallisce, con motivazione nel manifest.
 - Chiavi mascherate e suddivise in componenti separate nel loader.
 - Cifrato frammentato, codificato Base85, permutato e mescolato con chunk esca.
 - Identificatori del loader differenti per ogni build.
@@ -23,21 +28,24 @@ Il progetto non usa AES. Il loader generato dipende esclusivamente dalla libreri
 - Runtime guard contro monkey-patch Python di `compile`, `zlib.decompress` e, in modalità hardened, `marshal.loads`.
 - Modalità opzionale `--runtime-hardening` senza ricostruzione del sorgente a runtime.
 - Modalità `--code-object-hardening` per ridurre metadata e costanti leggibili nei dump.
-- VM stack-based con opcode casuali per virtualizzare espressioni aritmetiche sicure.
+- VM per scope/funzione con opcode casuali e template diversi: stack VM, register VM e dispatcher a tabella.
+- CFG obfuscation opzionale per piccole funzioni lineari tramite dispatcher a stato, saltando automaticamente `try`, `yield`, `await`, chiamate e costrutti sensibili.
+- Supporto directory/package: offusca ricorsivamente i file `.py`, copia le risorse e conserva import relativi ed entry point `python -m package`.
 - Sigillo SHA-256 canonico dell’intero artefatto verificato prima della decifratura.
 - Azzeramento best-effort dei buffer mutabili contenenti chiavi, payload compresso e dati serializzati.
 - Build casuali per impostazione predefinita o riproducibili tramite `--seed`.
 - Manifest JSON opzionale senza plaintext o chiavi ricostruite.
 - Verifica differenziale automatica tra programma originale e programma protetto.
+- Benchmark leggero per file singoli: dimensione output e tempi subprocess originale/protetto.
 - Nessuna dipendenza Python esterna.
 
 ## Requisiti
 
 - CPython 3.10 o successivo è raccomandato.
 - Lo sviluppo corrente è stato verificato con CPython 3.10 e 3.13.
-- Il file da proteggere deve essere sintatticamente valido per la versione Python usata durante la build.
+- Il file o package da proteggere deve essere sintatticamente valido per la versione Python usata durante la build.
 
-Ekitten Final protegge un file Python alla volta. Non è ancora un packager ricorsivo di interi package con risorse, estensioni native e metadata di distribuzione.
+Il supporto package lavora su directory sorgente reali: copia risorse non-Python e offusca ogni modulo `.py`. Non genera wheel, metadata di distribuzione o bundle di estensioni native.
 
 ## Utilizzo rapido
 
@@ -52,12 +60,41 @@ Senza `--output`, il risultato viene scritto accanto all’input come `programma
 Protezione massima con otto round e verifica automatica:
 
 ```powershell
+py -3.13 ".\Ekitten Final.py" ".\Ekitten-Tester.py" `
+  --output ".\programma-protetto.py" `
+  --profile maximum `
+  --layers 8 `
+  --vm-obfuscation `
+  --cfg-obfuscation `
+  --verify
+```
+
+```powershell
+py -3.13 ".\Ekitten Final.py" ".\Ekitten-Tester.py" --output ".\programma-protetto.py" --profile maximum --layers 8 --vm-obfuscation --cfg-obfuscation --verify
+```
+
+Comando più aggressivo consigliato per uno script già coperto da test differenziali, quando docstring, traceback e introspezione dei code object non fanno parte del contratto pubblico:
+
+```powershell
 py -3.13 ".\Ekitten Final.py" ".\programma.py" `
   --output ".\programma-protetto.py" `
   --profile maximum `
   --layers 8 `
-  --verify
+  --runtime-hardening `
+  --code-object-hardening `
+  --vm-obfuscation `
+  --cfg-obfuscation `
+  --anti-tamper `
+  --verify `
+  --benchmark `
+  --manifest ".\programma.manifest.json"
 ```
+
+```powershell
+py -3.13 ".\Ekitten Final.py" ".\Ekitten-Tester.py" --output ".\programma-protetto.py" --profile maximum --layers 8 --runtime-hardening --code-object-hardening --vm-obfuscation --cfg-obfuscation --anti-tamper --verify   --benchmark --manifest ".\programma.manifest.json
+```
+
+Per librerie o CLI che espongono docstring, filename, numeri di riga o `inspect`, rimuovere `--code-object-hardening`. Per codice non deterministico, usare una fixture di verifica dedicata invece di `--verify` semplice.
 
 Build riproducibile con manifest:
 
@@ -66,6 +103,25 @@ py -3.13 ".\Ekitten Final.py" ".\programma.py" `
   --profile balanced `
   --seed 2026 `
   --manifest ".\programma.manifest.json"
+```
+
+```powershell
+py -3.13 ".\Ekitten Final.py" ".\programma.py" --profile balanced --seed 2026 --manifest ".\programma.manifest.json"
+```
+
+Package directory con import relativi, risorse e `python -m package`:
+
+```powershell
+py -3.13 ".\Ekitten Final.py" ".\mio_package" `
+  --output ".\dist\mio_package" `
+  --profile maximum `
+  --vm-obfuscation `
+  --cfg-obfuscation `
+  --manifest ".\dist\mio_package.manifest.json"
+```
+
+```powershell
+py -3.13 ".\Ekitten Final.py" ".\mio_package" --output ".\dist\mio_package" --profile maximum --vm-obfuscation --cfg-obfuscation --manifest ".\dist\mio_package.manifest.json"
 ```
 
 Protezione runtime rafforzata, vincolata alla minor version Python usata per la build:
@@ -129,6 +185,8 @@ Nei profili `balanced` e `maximum`, le stringhe utilizzabili come normali espres
 
 Ogni strategia usa un token casuale differente per build e l’ordine dei branch del decoder viene permutato. La trasformazione opera sui byte, quindi conserva Unicode, caratteri null, newline, tab, slash e stringhe molto lunghe.
 
+La ricostruzione è lazy: la stringa viene ricreata soltanto quando l'espressione viene valutata. Il decoder usa buffer `bytearray` temporanei e li azzera in `finally` dopo la conversione a `str`. Questo riduce la permanenza dei byte intermedi, ma non può cancellare la stringa immutabile risultante né eventuali copie interne di CPython.
+
 Sono protetti dalla trasformazione i contesti che devono mantenere una struttura compile-time particolare:
 
 - docstring di modulo, classe e funzione;
@@ -158,7 +216,15 @@ Come per le stringhe, annotation e pattern di matching non vengono alterati.
 
 ### VM Obfuscation opzionale
 
-Con `--vm-obfuscation`, gli alberi aritmetici considerati sicuri vengono convertiti in programmi postfix per una stack VM inserita nel sorgente trasformato. Ogni programma contiene opcode numerici casuali e indici di thunk; l’interprete VM cambia token e ordine dei branch a ogni build.
+Con `--vm-obfuscation`, gli alberi aritmetici considerati sicuri vengono convertiti in piccoli programmi virtuali inseriti nel sorgente trasformato. La pass non usa più un solo interprete per build: ogni scope/funzione che contiene espressioni virtualizzate riceve un helper dedicato con opcode, maschere e dispatcher propri.
+
+Il template viene scelto per funzione e seed tra:
+
+- stack VM;
+- register VM;
+- stack VM con dispatcher a tabella.
+
+Ogni programma contiene opcode numerici casuali e indici di thunk; il manifest riporta quante espressioni, istruzioni e template sono stati realmente usati.
 
 La VM supporta:
 
@@ -173,9 +239,22 @@ Gli operandi vengono forniti come thunk senza argomenti e caricati dalla VM nell
 
 Non è una reimplementazione completa dell’interprete Python: è una virtualizzazione conservativa delle espressioni. Questa scelta mantiene compatibilità e permette al manifest di riportare espressioni, istruzioni e operatori realmente virtualizzati.
 
+### CFG Obfuscation opzionale
+
+Con `--cfg-obfuscation`, Ekitten trasforma soltanto funzioni piccole e lineari in un dispatcher a stato con confronti e salti espliciti. La pass è deliberatamente stretta: richiede un blocco breve con assegnazioni semplici e `return` finale, senza control flow interno.
+
+La pass salta automaticamente funzioni che contengono:
+
+- `try`, `with`, loop, `if`, `match`, `raise`;
+- `yield`, `yield from`, `await` e funzioni async;
+- chiamate, attribute access dinamico, comprehension e lambda;
+- `global`, `nonlocal`, reflection o nomi dinamici come `eval`, `exec`, `locals`, `globals`, `getattr`, `setattr` e `pickle`.
+
+Se non trova blocchi adatti, non forza la trasformazione. Il manifest riporta il motivo dello skip.
+
 ### 5. Normalizzazione AST
 
-Dopo le trasformazioni, l’albero viene corretto con `ast.fix_missing_locations()`, rigenerato con `ast.unparse()` e compilato nuovamente.
+Dopo ogni pass atomica, l’albero viene corretto con `ast.fix_missing_locations()` e compilato. Se una pass produce un AST invalido, viene ripristinato lo stato precedente e la motivazione finisce in `skipped_passes`. Alla fine l’albero viene rigenerato con `ast.unparse()` e compilato nuovamente.
 
 Questa fase elimina commenti e formattazione originale nei profili che effettuano trasformazioni AST. Le docstring vengono invece conservate perché possono essere osservate dal programma.
 
@@ -308,7 +387,10 @@ py -3.13 ".\Ekitten Final.py" ".\programma.py" `
   --runtime-hardening `
   --code-object-hardening `
   --vm-obfuscation `
-  --anti-tamper
+  --cfg-obfuscation `
+  --anti-tamper `
+  --verify `
+  --manifest ".\programma-vm-sealed.manifest.json"
 ```
 
 Non è una barriera assoluta: le istruzioni e le costanti indispensabili devono essere presenti quando CPython esegue una funzione. Un analista con controllo dell’interprete può ancora accedere a frame e `function.__code__`. Per impedirlo realmente occorre non distribuire la logica oppure spostarla in un runtime nativo isolato.
@@ -328,7 +410,9 @@ Prima di ricostruire chiavi o payload, il bootstrap:
 
 Questo sigillo si aggiunge ai tag BlazingOpossum per round e al digest del payload compresso. Richiede esecuzione da un file reale: esecuzione da stringa, database o loader virtuale senza `__file__` viene rifiutata.
 
-Come ogni controllo self-contained, un reverse engineer può rimuovere sia verifica sia errore modificando il bootstrap. Il sigillo rileva modifiche e patch non coordinate, ma non costituisce una root of trust esterna. Una firma digitale con chiave privata conservata fuori dalla build sarebbe il passo successivo per autenticare l’origine.
+Come ogni controllo self-contained, un reverse engineer può rimuovere sia verifica sia errore modificando il bootstrap. Il sigillo rileva modifiche e patch non coordinate, ma non costituisce una root of trust esterna.
+
+Le firme digitali con chiave privata esterna non sono ancora implementate perché la libreria standard non offre Ed25519/RSA-PSS ad alto livello e il progetto evita primitive crittografiche custom. Il passo corretto è introdurre una dipendenza mantenuta, per esempio `cryptography`, mantenendo solo la chiave pubblica nel loader e firmando fuori dall’artefatto distribuito.
 
 ## Riepilogo del flusso
 
@@ -336,7 +420,8 @@ Come ogni controllo self-contained, un reverse engineer può rimuovere sia verif
 Sorgente Python
     ↓ parse + compile
 AST conservativo
-    ↓ stringhe / interi / locali / VM secondo configurazione
+    ↓ pass atomiche con rollback
+    ↓ stringhe / interi / locali / VM / CFG secondo configurazione
 Sorgente trasformato
     ↓ portabile: bytes UTF-8
     ↓ hardened: compile build-time + marshal, vincolo Python X.Y
@@ -362,8 +447,10 @@ usage: Ekitten Final.py [-h] [-o OUTPUT]
                         [--layers LAYERS] [--seed SEED]
                         [--runtime-hardening]
                         [--code-object-hardening]
-                        [--vm-obfuscation] [--anti-tamper]
-                        [--manifest MANIFEST] [--verify]
+                        [--vm-obfuscation] [--cfg-obfuscation]
+                        [--anti-tamper]
+                        [--manifest MANIFEST] [--verify] [--benchmark]
+                        [--benchmark-repeat N]
                         [--verify-arg VALUE] [--timeout SECONDS]
                         [--self-test] [--version]
                         [input]
@@ -371,17 +458,20 @@ usage: Ekitten Final.py [-h] [-o OUTPUT]
 
 ### Argomenti principali
 
-- `input`: file Python da proteggere.
+- `input`: file Python o directory package da proteggere.
 - `-o`, `--output`: percorso del file generato.
 - `--profile`: livello di trasformazione AST e valori predefiniti della protezione.
 - `--layers`: numero di round BlazingOpossum, da 1 a 12.
 - `--seed`: rende la build riproducibile.
 - `--runtime-hardening`: usa un code object serializzato, evita sorgente/`compile` a runtime e vincola l’output alla minor version della build.
 - `--code-object-hardening`: richiede runtime hardening; rimuove docstring, offusca literal delle f-string e sanitizza ricorsivamente filename e line table. Modifica introspezione e traceback.
-- `--vm-obfuscation`: converte espressioni aritmetiche conservative in bytecode per una stack VM polimorfica.
+- `--vm-obfuscation`: converte espressioni aritmetiche conservative in bytecode per VM per-scope con template stack, register o table-dispatch.
+- `--cfg-obfuscation`: converte piccole funzioni lineari in dispatcher a stato; salta automaticamente costrutti sensibili.
 - `--anti-tamper`: sigilla tutto il file generato e lo verifica prima della decifratura; richiede esecuzione file-backed.
 - `--manifest`: scrive metadata e hash della build in JSON.
 - `--verify`: esegue originale e output e confronta exit code, stdout e stderr.
+- `--benchmark`: misura tempi subprocess e dimensione per file singoli.
+- `--benchmark-repeat`: numero di ripetizioni benchmark per file.
 - `--verify-arg`: argomento da passare a entrambi i programmi durante la verifica; può essere ripetuto.
 - `--timeout`: timeout per ognuno dei due processi di verifica.
 - `--self-test`: verifica cipher, tamper detection e loader per tutti i profili.
@@ -404,6 +494,23 @@ py -3.13 ".\Ekitten Final.py" ".\programma.py" `
 
 La verifica esegue realmente entrambi i file. Va usata esclusivamente con sorgenti fidati e può non essere adatta a programmi che modificano file, accedono alla rete, aspettano input o producono output non deterministico.
 
+## Benchmark
+
+`--benchmark` esegue originale e output in subprocess e riporta tempi mediani, caso peggiore e rapporto dimensionale. Usa gli stessi `--verify-arg` e `--timeout` della verifica differenziale:
+
+```powershell
+py -3.13 ".\Ekitten Final.py" ".\programma.py" `
+  -o ".\programma-protetto.py" `
+  --profile maximum `
+  --vm-obfuscation `
+  --cfg-obfuscation `
+  --verify `
+  --benchmark `
+  --benchmark-repeat 5
+```
+
+La memoria di picco viene lasciata `null` nel report interno perché non esiste una misura RSS portabile nella libreria standard. Per budget di release usare strumenti esterni di sistema o CI dedicata.
+
 ## Suite di compatibilità inclusa
 
 Il repository contiene [test.py](./test.py), uno script auto-validante creato per essere protetto da Ekitten Final. Il test copre:
@@ -418,9 +525,10 @@ Il repository contiene [test.py](./test.py), uno script auto-validante creato pe
 - coroutine, async generator e async context manager;
 - structural pattern matching;
 - comprehension, lambda e assignment expression;
+- piccola funzione lineare per CFG obfuscation;
 - exception chaining;
 - `eval`, `exec`, `locals` e `globals` in uno scope controllato;
-- pickle, JSON, regex, hashing e introspezione delle annotation.
+- pickle, JSON, regex, hashing e introspezione delle annotation;
 - operatori binari/unari supportati dalla VM, incluso `@` con overload controllato.
 
 Eseguire l’originale:
@@ -458,6 +566,25 @@ py -3.13 ".\Ekitten Final.py" ".\test.py" `
   --verify-arg=--allow-stripped-docstrings
 ```
 
+Provare la combinazione più aggressiva sul fixture incluso:
+
+```powershell
+py -3.13 ".\Ekitten Final.py" ".\test.py" `
+  -o ".\test-maximum-all.py" `
+  --profile maximum `
+  --runtime-hardening `
+  --code-object-hardening `
+  --vm-obfuscation `
+  --cfg-obfuscation `
+  --anti-tamper `
+  --verify `
+  --verify-arg=--allow-stripped-docstrings
+```
+
+```powershell
+py -3.13 ".\Ekitten Final.py" ".\test.py" -o ".\test-maximum-all.py" --profile maximum --runtime-hardening --code-object-hardening --vm-obfuscation --cfg-obfuscation --anti-tamper --verify --verify-arg=--allow-stripped-docstrings
+```
+
 I file `test-*.py` sono artefatti generati e possono essere eliminati dopo il test.
 
 ## Self-test dell’obfuscator
@@ -475,10 +602,16 @@ Il self-test controlla:
 - generazione ed esecuzione dei profili `compatible`, `balanced` e `maximum`.
 - generazione ed esecuzione di un payload `maximum --runtime-hardening`.
 - generazione ed esecuzione della modalità code-object hardened con docstring rimosse e metadata sanitizzati.
-- esecuzione di espressioni virtualizzate e presenza del relativo report nel manifest;
+- esecuzione di espressioni virtualizzate con VM per-scope e presenza del relativo report nel manifest;
+- esecuzione della CFG obfuscation su una funzione lineare;
+- offuscamento ricorsivo di un package temporaneo con import relativo, risorsa dati e avvio tramite `python -m`;
 - esecuzione di un artefatto sigillato e rifiuto dello stesso file dopo una modifica;
 - rifiuto dei monkey-patch Python su `compile`, `zlib.decompress`, `marshal.loads` e `open`;
 - conferma che il bootstrap hardened non invochi un `exec` monkey-patched.
+
+## Compatibility CI
+
+La workflow `.github/workflows/compatibility.yml` esegue `--self-test` su CPython 3.9-3.14 e, da CPython 3.10 in poi, esegue anche la fixture differenziale `test.py` sui profili `compatible`, `balanced` e `maximum` hardened con VM, CFG e anti-tamper. La fixture completa parte da 3.10 perché include structural pattern matching.
 
 ## Compatibilità e limitazioni note
 
@@ -490,8 +623,11 @@ Il self-test controlla:
 - Il loader hardened non usa né `compile()` né `exec()` a runtime, ma `marshal` lo vincola esattamente alla minor version CPython della build.
 - `--code-object-hardening` imposta `__doc__` a `None`, riduce le informazioni dei traceback e non è semanticamente trasparente per programmi che osservano questi metadata.
 - La VM copre espressioni aritmetiche sicure, non ogni istruzione Python; aumenta dimensione e overhead runtime.
+- La CFG obfuscation copre solo funzioni brevi e lineari. Se trova `try`, `yield`, `await`, chiamate o costrutti sensibili, salta la funzione e registra il motivo nel manifest.
 - Il sigillo anti-tamper considera anche newline e commenti: formatter, editor o sistemi che riscrivono il file ne causano correttamente il rifiuto.
-- Moduli C, dipendenze esterne e file importati non vengono inclusi automaticamente.
+- Il supporto package copia risorse e moduli `.py`, ma non crea wheel, metadata di distribuzione o bundle di estensioni native.
+- Moduli C e dipendenze esterne non vengono inclusi automaticamente.
+- Le firme digitali con chiave privata esterna sono una feature pianificata, non ancora presente: il sigillo attuale è integrità self-contained, non autenticità esterna.
 - Codice che legge o modifica il proprio file vedrà il loader, non il sorgente originale.
 - Programmi non deterministici possono fallire `--verify` anche se semanticamente corretti.
 - Aumentare indiscriminatamente i round non equivale a una prova crittografica più forte.
@@ -510,7 +646,7 @@ Ekitten Final è adatto a rendere più costose:
 - recupero immediato del sorgente nella modalità hardened, dove il testo non viene ricostruito a runtime.
 - dump immediatamente leggibili di docstring, filename, line table e literal di f-string nella modalità code-object hardened.
 - patch non coordinate del loader o del payload quando il sigillo completo è attivo;
-- riconoscimento statico immediato delle espressioni virtualizzate grazie agli opcode polimorfici.
+- riconoscimento statico immediato delle espressioni virtualizzate grazie agli opcode polimorfici per funzione.
 
 Non garantisce protezione assoluta contro:
 

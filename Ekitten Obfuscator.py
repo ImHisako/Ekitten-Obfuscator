@@ -17,6 +17,7 @@ import argparse
 import ast
 import base64
 import builtins
+import copy
 import hashlib
 import hmac
 import json
@@ -24,10 +25,12 @@ import marshal
 import os
 import random
 import secrets
+import shutil
 import struct
 import subprocess
 import sys
 import tempfile
+import time
 import tokenize
 import zlib
 from dataclasses import dataclass
@@ -35,7 +38,7 @@ from pathlib import Path
 from typing import Dict, List, Mapping, Optional, Sequence, Set, Tuple
 
 
-__version__ = "1.5.0"
+__version__ = "1.6.0"
 
 
 class EkittenError(Exception):
@@ -79,6 +82,7 @@ class ObfuscationConfig:
     runtime_hardening: bool = False
     code_object_hardening: bool = False
     vm_obfuscation: bool = False
+    cfg_obfuscation: bool = False
     anti_tamper: bool = False
 
     def resolved_profile(self) -> Profile:
@@ -108,6 +112,7 @@ class ObfuscationResult:
     output_sha256: str
     applied_passes: Tuple[str, ...]
     runtime_mode: str
+    skipped_passes: Tuple[str, ...] = ()
 
 
 class BuildEntropy:
@@ -371,6 +376,7 @@ class ConservativeLocalRenamer(ast.NodeTransformer):
     def __init__(self, entropy: BuildEntropy, used_names: Set[str]) -> None:
         self.entropy = entropy
         self.used_names = used_names
+        self.renamed_symbols = 0
 
     def _safe_mapping(self, node: ast.AST, arguments: ast.arguments) -> Dict[str, str]:
         descendants = list(ast.walk(node))
@@ -433,6 +439,7 @@ class ConservativeLocalRenamer(ast.NodeTransformer):
             self.visit(statement)
         mapping = self._safe_mapping(node, arguments)
         if mapping:
+            self.renamed_symbols += len(mapping)
             rewriter = _ScopedNameRewriter(mapping)
             node.body = [rewriter.visit(statement) for statement in node.body]  # type: ignore[attr-defined]
         return node
@@ -635,22 +642,31 @@ class StringObfuscator(ast.NodeTransformer):
     def helper_source(self) -> str:
         branches = {
             0: """    if token == {token}:
-        return bytes((value - key - index * 17) & 255 for index, value in enumerate(data)).decode('utf-8')""",
+        buffer = bytearray((value - key - index * 17) & 255 for index, value in enumerate(data))
+        return finish(buffer)""",
             1: """    if token == {token}:
-        return bytes(value ^ ((key + index * 29) & 255) for index, value in enumerate(data)).decode('utf-8')""",
+        buffer = bytearray(value ^ ((key + index * 29) & 255) for index, value in enumerate(data))
+        return finish(buffer)""",
             2: """    if token == {token}:
-        return bytes(value ^ key for value in reversed(data)).decode('utf-8')""",
+        buffer = bytearray(value ^ key for value in reversed(data))
+        return finish(buffer)""",
             3: """    if token == {token}:
-        return bytes(((((value >> auxiliary) | (value << (8 - auxiliary))) & 255) ^ key) for value in data).decode('utf-8')""",
+        buffer = bytearray(((((value >> auxiliary) | (value << (8 - auxiliary))) & 255) ^ key) for value in data)
+        return finish(buffer)""",
             4: """    if token == {token}:
-        return bytes(((value - key - index) * auxiliary) & 255 for index, value in enumerate(data)).decode('utf-8')""",
+        buffer = bytearray(((value - key - index) * auxiliary) & 255 for index, value in enumerate(data))
+        return finish(buffer)""",
             5: """    if token == {token}:
-        mixed = bytes(value ^ ((key + index * 13) & 255) for index, value in enumerate(data))
+        mixed = bytearray(value ^ ((key + index * 13) & 255) for index, value in enumerate(data))
         split = (auxiliary + 1) // 2
         result = bytearray(auxiliary)
         result[::2] = mixed[:split]
         result[1::2] = mixed[split:]
-        return bytes(result).decode('utf-8')""",
+        try:
+            return finish(result)
+        finally:
+            for index in range(len(mixed)):
+                mixed[index] = 0""",
         }
         rendered = [
             branches[index].format(token=self.tokens[index])
@@ -659,6 +675,12 @@ class StringObfuscator(ast.NodeTransformer):
         self.entropy.random.shuffle(rendered)
         return (
             "def {0}(token, data, key, auxiliary):\n".format(self.string_helper)
+            + "    def finish(buffer):\n"
+            + "        try:\n"
+            + "            return bytes(buffer).decode('utf-8')\n"
+            + "        finally:\n"
+            + "            for index in range(len(buffer)):\n"
+            + "                buffer[index] = 0\n"
             + "\n".join(rendered)
             + "\n    raise RuntimeError('invalid string reconstruction token')\n"
         )
@@ -765,8 +787,17 @@ class IntObfuscator(ast.NodeTransformer):
         )
 
 
+@dataclass(frozen=True)
+class _VMTemplate:
+    helper_name: str
+    kind: str
+    push_token: int
+    operator_tokens: Mapping[type, int]
+    unary_tokens: Mapping[type, int]
+
+
 class VMObfuscator(ast.NodeTransformer):
-    """Virtualize side-effect-free arithmetic trees into a polymorphic stack VM."""
+    """Virtualize conservative expression trees with per-scope VM templates."""
 
     OPERATORS: Tuple[Tuple[type, str, str], ...] = (
         (ast.Add, "add", "left + right"),
@@ -792,29 +823,24 @@ class VMObfuscator(ast.NodeTransformer):
 
     def __init__(
         self,
-        helper_name: str,
         entropy: BuildEntropy,
         protected_roots: Set[int],
+        used_names: Set[str],
     ) -> None:
-        self.helper_name = helper_name
         self.entropy = entropy
         self.protected_roots = protected_roots
-        self.push_token = self._new_token(set())
-        used_tokens = {self.push_token}
-        self.operator_tokens: Dict[type, int] = {}
-        for operator_type, _, _ in self.OPERATORS:
-            token = self._new_token(used_tokens)
-            used_tokens.add(token)
-            self.operator_tokens[operator_type] = token
-        self.unary_tokens: Dict[type, int] = {}
-        for operator_type, _, _ in self.UNARY_OPERATORS:
-            token = self._new_token(used_tokens)
-            used_tokens.add(token)
-            self.unary_tokens[operator_type] = token
+        self.used_names = used_names
+        self.templates: List[_VMTemplate] = []
+        self.current_template: Optional[_VMTemplate] = None
         self.expression_count = 0
         self.instruction_count = 0
         self.used_operators: Set[str] = set()
         self.generated_program_roots: Set[int] = set()
+        self.template_counts: Dict[str, int] = {
+            "stack": 0,
+            "register": 0,
+            "table": 0,
+        }
 
     def _new_token(self, used: Set[int]) -> int:
         while True:
@@ -822,10 +848,57 @@ class VMObfuscator(ast.NodeTransformer):
             if token not in used:
                 return token
 
+    def _new_template(self) -> _VMTemplate:
+        used_tokens: Set[int] = set()
+        push_token = self._new_token(used_tokens)
+        used_tokens.add(push_token)
+        operator_tokens: Dict[type, int] = {}
+        for operator_type, _, _ in self.OPERATORS:
+            token = self._new_token(used_tokens)
+            used_tokens.add(token)
+            operator_tokens[operator_type] = token
+        unary_tokens: Dict[type, int] = {}
+        for operator_type, _, _ in self.UNARY_OPERATORS:
+            token = self._new_token(used_tokens)
+            used_tokens.add(token)
+            unary_tokens[operator_type] = token
+        kind = self.entropy.random.choice(("stack", "register", "table"))
+        template = _VMTemplate(
+            helper_name=self.entropy.identifier(self.used_names),
+            kind=kind,
+            push_token=push_token,
+            operator_tokens=operator_tokens,
+            unary_tokens=unary_tokens,
+        )
+        self.templates.append(template)
+        self.template_counts[kind] += 1
+        return template
+
+    def _template_for_current_scope(self) -> _VMTemplate:
+        if self.current_template is None:
+            self.current_template = self._new_template()
+        return self.current_template
+
     def visit(self, node: ast.AST) -> ast.AST:
         if id(node) in self.protected_roots:
             return node
         return super().visit(node)
+
+    def _visit_function_scope(
+        self,
+        node: ast.AST,
+    ) -> ast.AST:
+        previous_template = self.current_template
+        self.current_template = None
+        self.generic_visit(node)
+        self.current_template = previous_template
+        return node
+
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> ast.AST:
+        return self._visit_function_scope(node)
+
+    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> ast.AST:
+        return self._visit_function_scope(node)
 
     def visit_ClassDef(self, node: ast.ClassDef) -> ast.AST:
         new_body: List[ast.stmt] = []
@@ -870,6 +943,7 @@ class VMObfuscator(ast.NodeTransformer):
     def _compile_expression(
         self,
         node: ast.AST,
+        template: _VMTemplate,
         program: List[Tuple[int, int]],
         thunks: List[ast.Lambda],
     ) -> None:
@@ -889,48 +963,145 @@ class VMObfuscator(ast.NodeTransformer):
                     body=node,  # type: ignore[arg-type]
                 )
             )
-            program.append((self.push_token, index))
+            program.append((template.push_token, index))
             return
         if isinstance(node, ast.UnaryOp):
-            self._compile_expression(node.operand, program, thunks)
+            self._compile_expression(node.operand, template, program, thunks)
             unary_entry = self._unary_entry(node.op)
             if unary_entry is None:
                 raise SourceTransformError("Unsupported VM unary operator")
-            program.append((self.unary_tokens[unary_entry[0]], 0))
+            program.append((template.unary_tokens[unary_entry[0]], 0))
             self.used_operators.add(unary_entry[1])
             return
         if not isinstance(node, ast.BinOp):
             raise SourceTransformError("Unsupported VM expression node")
-        self._compile_expression(node.left, program, thunks)
-        self._compile_expression(node.right, program, thunks)
+        self._compile_expression(node.left, template, program, thunks)
+        self._compile_expression(node.right, template, program, thunks)
         entry = self._operator_entry(node.op)
         if entry is None:
             raise SourceTransformError("Unsupported VM operator")
-        token = self.operator_tokens[entry[0]]
+        token = template.operator_tokens[entry[0]]
         program.append((token, 0))
         self.used_operators.add(entry[1])
+
+    def _compile_register_expression(
+        self,
+        node: ast.AST,
+        template: _VMTemplate,
+        program: List[Tuple[int, ...]],
+        thunks: List[ast.Lambda],
+        next_register: List[int],
+    ) -> int:
+        def allocate_register() -> int:
+            register = next_register[0]
+            next_register[0] += 1
+            return register
+
+        if isinstance(node, (ast.Name, ast.Constant)):
+            thunk_index = len(thunks)
+            register = allocate_register()
+            thunks.append(
+                ast.Lambda(
+                    args=ast.arguments(
+                        posonlyargs=[],
+                        args=[],
+                        vararg=None,
+                        kwonlyargs=[],
+                        kw_defaults=[],
+                        kwarg=None,
+                        defaults=[],
+                    ),
+                    body=node,  # type: ignore[arg-type]
+                )
+            )
+            program.append((template.push_token, thunk_index, register))
+            return register
+        if isinstance(node, ast.UnaryOp):
+            source_register = self._compile_register_expression(
+                node.operand,
+                template,
+                program,
+                thunks,
+                next_register,
+            )
+            target_register = allocate_register()
+            unary_entry = self._unary_entry(node.op)
+            if unary_entry is None:
+                raise SourceTransformError("Unsupported VM unary operator")
+            program.append(
+                (
+                    template.unary_tokens[unary_entry[0]],
+                    source_register,
+                    target_register,
+                )
+            )
+            self.used_operators.add(unary_entry[1])
+            return target_register
+        if not isinstance(node, ast.BinOp):
+            raise SourceTransformError("Unsupported VM expression node")
+        left_register = self._compile_register_expression(
+            node.left,
+            template,
+            program,
+            thunks,
+            next_register,
+        )
+        right_register = self._compile_register_expression(
+            node.right,
+            template,
+            program,
+            thunks,
+            next_register,
+        )
+        target_register = allocate_register()
+        entry = self._operator_entry(node.op)
+        if entry is None:
+            raise SourceTransformError("Unsupported VM operator")
+        program.append(
+            (
+                template.operator_tokens[entry[0]],
+                left_register,
+                right_register,
+                target_register,
+            )
+        )
+        self.used_operators.add(entry[1])
+        return target_register
 
     def _virtualize(self, node: ast.AST) -> ast.AST:
         if not self._is_virtualizable(node):
             return self.generic_visit(node)
-        program: List[Tuple[int, int]] = []
+        template = self._template_for_current_scope()
         thunks: List[ast.Lambda] = []
-        self._compile_expression(node, program, thunks)
+        if template.kind == "register":
+            register_program: List[Tuple[int, ...]] = []
+            self._compile_register_expression(
+                node,
+                template,
+                register_program,
+                thunks,
+                [0],
+            )
+            program_entries = register_program
+        else:
+            stack_program: List[Tuple[int, int]] = []
+            self._compile_expression(node, template, stack_program, thunks)
+            program_entries = stack_program
         program_node = ast.Tuple(
             elts=[
                 ast.Tuple(
-                    elts=[ast.Constant(value=opcode), ast.Constant(value=argument)],
+                    elts=[ast.Constant(value=item) for item in entry],
                     ctx=ast.Load(),
                 )
-                for opcode, argument in program
+                for entry in program_entries
             ],
             ctx=ast.Load(),
         )
         self.generated_program_roots.add(id(program_node))
         self.expression_count += 1
-        self.instruction_count += len(program)
+        self.instruction_count += len(program_entries)
         call = ast.Call(
-            func=ast.Name(id=self.helper_name, ctx=ast.Load()),
+            func=ast.Name(id=template.helper_name, ctx=ast.Load()),
             args=[
                 program_node,
                 ast.Tuple(elts=thunks, ctx=ast.Load()),
@@ -946,9 +1117,19 @@ class VMObfuscator(ast.NodeTransformer):
         return self._virtualize(node)
 
     def helper_source(self) -> str:
+        return "\n".join(self._helper_source(template) for template in self.templates)
+
+    def _helper_source(self, template: _VMTemplate) -> str:
+        if template.kind == "register":
+            return self._register_helper_source(template)
+        if template.kind == "table":
+            return self._table_helper_source(template)
+        return self._stack_helper_source(template)
+
+    def _stack_helper_source(self, template: _VMTemplate) -> str:
         branches: List[str] = [
             """        if opcode == {0}:
-            stack.append(thunks[argument]())""".format(self.push_token)
+            stack.append(thunks[argument]())""".format(template.push_token)
         ]
         for operator_type, _, expression in self.OPERATORS:
             branches.append(
@@ -956,7 +1137,7 @@ class VMObfuscator(ast.NodeTransformer):
             right = stack.pop()
             left = stack.pop()
             stack.append({1})""".format(
-                    self.operator_tokens[operator_type], expression
+                    template.operator_tokens[operator_type], expression
                 )
             )
         for operator_type, _, expression in self.UNARY_OPERATORS:
@@ -964,7 +1145,7 @@ class VMObfuscator(ast.NodeTransformer):
                 """        if opcode == {0}:
             value = stack.pop()
             stack.append({1})""".format(
-                    self.unary_tokens[operator_type], expression
+                    template.unary_tokens[operator_type], expression
                 )
             )
         self.entropy.random.shuffle(branches)
@@ -978,7 +1159,325 @@ class VMObfuscator(ast.NodeTransformer):
     if len(stack) != 1:
         raise RuntimeError('invalid VM stack state')
     return stack[0]
-""".format(helper=self.helper_name, branches=rendered)
+""".format(helper=template.helper_name, branches=rendered)
+
+    def _table_helper_source(self, template: _VMTemplate) -> str:
+        functions: List[str] = [
+            """    def op_push(argument):
+        stack.append(thunks[argument]())"""
+        ]
+        entries: List[Tuple[int, str]] = [(template.push_token, "op_push")]
+        for index, (operator_type, name, expression) in enumerate(self.OPERATORS):
+            function_name = "op_{0}_{1}".format(index, name.replace("-", "_"))
+            functions.append(
+                """    def {name}(argument):
+        right = stack.pop()
+        left = stack.pop()
+        stack.append({expression})""".format(
+                    name=function_name,
+                    expression=expression,
+                )
+            )
+            entries.append((template.operator_tokens[operator_type], function_name))
+        for index, (operator_type, name, expression) in enumerate(self.UNARY_OPERATORS):
+            function_name = "op_u{0}_{1}".format(index, name.replace("-", "_"))
+            functions.append(
+                """    def {name}(argument):
+        value = stack.pop()
+        stack.append({expression})""".format(
+                    name=function_name,
+                    expression=expression,
+                )
+            )
+            entries.append((template.unary_tokens[operator_type], function_name))
+        self.entropy.random.shuffle(entries)
+        table_entries = ", ".join(
+            "{0}: {1}".format(token, function_name)
+            for token, function_name in entries
+        )
+        return """def {helper}(program, thunks):
+    stack = []
+{functions}
+    handlers = {{{table_entries}}}
+    for opcode, argument in program:
+        handler = handlers.get(opcode)
+        if handler is None:
+            raise RuntimeError('invalid VM opcode')
+        handler(argument)
+    handlers.clear()
+    if len(stack) != 1:
+        raise RuntimeError('invalid VM stack state')
+    return stack[0]
+""".format(
+            helper=template.helper_name,
+            functions="\n".join(functions),
+            table_entries=table_entries,
+        )
+
+    def _register_helper_source(self, template: _VMTemplate) -> str:
+        branches: List[str] = [
+            """        if opcode == {0}:
+            registers[entry[2]] = thunks[entry[1]]()""".format(
+                template.push_token
+            )
+        ]
+        for operator_type, _, expression in self.OPERATORS:
+            branches.append(
+                """        if opcode == {0}:
+            left = registers[entry[1]]
+            right = registers[entry[2]]
+            registers[entry[3]] = {1}""".format(
+                    template.operator_tokens[operator_type],
+                    expression,
+                )
+            )
+        for operator_type, _, expression in self.UNARY_OPERATORS:
+            branches.append(
+                """        if opcode == {0}:
+            value = registers[entry[1]]
+            registers[entry[2]] = {1}""".format(
+                    template.unary_tokens[operator_type],
+                    expression,
+                )
+            )
+        self.entropy.random.shuffle(branches)
+        rendered = "\n            continue\n".join(branches)
+        return """def {helper}(program, thunks):
+    registers = {{}}
+    last_register = None
+    for entry in program:
+        opcode = entry[0]
+        last_register = entry[-1]
+{branches}
+            continue
+        raise RuntimeError('invalid VM opcode')
+    if last_register is None or last_register not in registers:
+        raise RuntimeError('invalid VM register state')
+    result = registers[last_register]
+    registers.clear()
+    return result
+""".format(helper=template.helper_name, branches=rendered)
+
+
+class ConservativeCFGObfuscator(ast.NodeTransformer):
+    """Turn tiny straight-line functions into a tokenized state dispatcher."""
+
+    MAX_STATEMENTS = 5
+    SENSITIVE_TYPES: Tuple[type, ...] = (
+        ast.Try,
+        ast.With,
+        ast.AsyncWith,
+        ast.For,
+        ast.AsyncFor,
+        ast.While,
+        ast.If,
+        ast.Raise,
+        ast.Yield,
+        ast.YieldFrom,
+        ast.Await,
+        ast.Lambda,
+        ast.ListComp,
+        ast.SetComp,
+        ast.DictComp,
+        ast.GeneratorExp,
+        ast.Call,
+        ast.Global,
+        ast.Nonlocal,
+    )
+    DYNAMIC_NAMES = ConservativeLocalRenamer.DYNAMIC_NAMES | {
+        "__import__",
+        "getattr",
+        "setattr",
+        "delattr",
+        "pickle",
+    }
+
+    def __init__(self, entropy: BuildEntropy, used_names: Set[str]) -> None:
+        self.entropy = entropy
+        self.used_names = used_names
+        self.function_count = 0
+        self.block_count = 0
+        self.skipped_reasons: Dict[str, int] = {}
+
+    def _skip(self, reason: str) -> None:
+        self.skipped_reasons[reason] = self.skipped_reasons.get(reason, 0) + 1
+
+    @staticmethod
+    def _is_docstring(statement: ast.stmt) -> bool:
+        return (
+            isinstance(statement, ast.Expr)
+            and isinstance(statement.value, ast.Constant)
+            and isinstance(statement.value.value, str)
+        )
+
+    def _simple_expression(self, node: Optional[ast.AST]) -> bool:
+        if node is None:
+            return True
+        if isinstance(node, ast.Name):
+            return isinstance(node.ctx, ast.Load)
+        if isinstance(node, ast.Constant):
+            return True
+        if isinstance(node, ast.Tuple):
+            return all(self._simple_expression(item) for item in node.elts)
+        if isinstance(node, ast.List):
+            return all(self._simple_expression(item) for item in node.elts)
+        if isinstance(node, ast.UnaryOp):
+            return self._simple_expression(node.operand)
+        if isinstance(node, ast.BinOp):
+            return self._simple_expression(node.left) and self._simple_expression(node.right)
+        return False
+
+    def _simple_statement(self, statement: ast.stmt, is_final: bool) -> bool:
+        for child in ast.walk(statement):
+            if isinstance(child, self.SENSITIVE_TYPES):
+                return False
+            if isinstance(child, ast.Name) and child.id in self.DYNAMIC_NAMES:
+                return False
+            match_type = getattr(ast, "Match", None)
+            if match_type is not None and isinstance(child, match_type):
+                return False
+        if is_final:
+            return isinstance(statement, ast.Return) and self._simple_expression(statement.value)
+        if isinstance(statement, ast.Assign):
+            return (
+                all(isinstance(target, ast.Name) for target in statement.targets)
+                and self._simple_expression(statement.value)
+            )
+        if isinstance(statement, ast.AnnAssign):
+            return (
+                isinstance(statement.target, ast.Name)
+                and statement.value is not None
+                and self._simple_expression(statement.value)
+            )
+        if isinstance(statement, ast.Expr):
+            return self._simple_expression(statement.value)
+        return False
+
+    def _eligible_body(self, node: ast.FunctionDef) -> Optional[Tuple[List[ast.stmt], List[ast.stmt]]]:
+        prefix: List[ast.stmt] = []
+        body = list(node.body)
+        if body and self._is_docstring(body[0]):
+            prefix.append(body[0])
+            body = body[1:]
+        if len(body) < 2 or len(body) > self.MAX_STATEMENTS:
+            self._skip("function-size-out-of-budget")
+            return None
+        for child in ast.walk(node):
+            if child is node:
+                continue
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                self._skip("nested-scope")
+                return None
+        for index, statement in enumerate(body):
+            if not self._simple_statement(statement, index == len(body) - 1):
+                self._skip("sensitive-or-nonlinear-statement")
+                return None
+        return prefix, body
+
+    def _token(self, used: Set[int]) -> int:
+        while True:
+            token = self.entropy.random.randint(1 << 20, (1 << 31) - 1)
+            if token not in used:
+                used.add(token)
+                return token
+
+    @staticmethod
+    def _name(identifier: str, context: ast.expr_context) -> ast.Name:
+        return ast.Name(id=identifier, ctx=context)
+
+    def _state_assign(self, state_name: str, token: int) -> ast.Assign:
+        return ast.Assign(
+            targets=[self._name(state_name, ast.Store())],
+            value=ast.Constant(value=token),
+        )
+
+    def _build_dispatcher(
+        self,
+        core_body: List[ast.stmt],
+        state_name: str,
+        result_name: str,
+    ) -> List[ast.stmt]:
+        used_tokens: Set[int] = set()
+        tokens = [self._token(used_tokens) for _ in range(len(core_body) + 1)]
+        cases: List[ast.stmt] = []
+        for index, statement in enumerate(core_body):
+            case_body: List[ast.stmt] = []
+            if index == len(core_body) - 1:
+                final_return = statement
+                if not isinstance(final_return, ast.Return):
+                    raise SourceTransformError("CFG block does not end in return")
+                case_body.append(
+                    ast.Assign(
+                        targets=[self._name(result_name, ast.Store())],
+                        value=final_return.value
+                        if final_return.value is not None
+                        else ast.Constant(value=None),
+                    )
+                )
+            else:
+                case_body.append(statement)
+            case_body.extend(
+                [
+                    self._state_assign(state_name, tokens[index + 1]),
+                    ast.Continue(),
+                ]
+            )
+            cases.append(
+                ast.If(
+                    test=ast.Compare(
+                        left=self._name(state_name, ast.Load()),
+                        ops=[ast.Eq()],
+                        comparators=[ast.Constant(value=tokens[index])],
+                    ),
+                    body=case_body,
+                    orelse=[],
+                )
+            )
+        cases.append(
+            ast.If(
+                test=ast.Compare(
+                    left=self._name(state_name, ast.Load()),
+                    ops=[ast.Eq()],
+                    comparators=[ast.Constant(value=tokens[-1])],
+                ),
+                body=[ast.Return(value=self._name(result_name, ast.Load()))],
+                orelse=[],
+            )
+        )
+        cases.append(
+            ast.Raise(
+                exc=ast.Call(
+                    func=ast.Name(id="RuntimeError", ctx=ast.Load()),
+                    args=[ast.Constant(value="invalid Ekitten CFG state")],
+                    keywords=[],
+                ),
+                cause=None,
+            )
+        )
+        self.block_count += len(tokens)
+        return [
+            self._state_assign(state_name, tokens[0]),
+            ast.Assign(
+                targets=[self._name(result_name, ast.Store())],
+                value=ast.Constant(value=None),
+            ),
+            ast.While(test=ast.Constant(value=True), body=cases, orelse=[]),
+        ]
+
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> ast.AST:
+        self.generic_visit(node)
+        eligible = self._eligible_body(node)
+        if eligible is None:
+            return node
+        prefix, core_body = eligible
+        state_name = self.entropy.identifier(self.used_names)
+        result_name = self.entropy.identifier(self.used_names)
+        node.body = prefix + self._build_dispatcher(core_body, state_name, result_name)
+        self.function_count += 1
+        return node
+
+    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> ast.AST:
+        return node
 
 
 def _safe_injection_index(module: ast.Module) -> int:
@@ -999,6 +1498,13 @@ def _safe_injection_index(module: ast.Module) -> int:
     return index
 
 
+@dataclass(frozen=True)
+class SourceTransformResult:
+    source: str
+    applied_passes: Tuple[str, ...]
+    skipped_passes: Tuple[str, ...]
+
+
 def transform_source(
     source: str,
     profile: Profile,
@@ -1006,7 +1512,8 @@ def transform_source(
     filename: str,
     code_object_hardening: bool = False,
     vm_obfuscation: bool = False,
-) -> Tuple[str, Tuple[str, ...]]:
+    cfg_obfuscation: bool = False,
+) -> SourceTransformResult:
     try:
         tree = ast.parse(source, filename=filename, type_comments=True)
         compile(tree, filename, "exec", dont_inherit=True)
@@ -1014,59 +1521,192 @@ def transform_source(
         raise SourceTransformError("Input cannot be parsed: {0}".format(error)) from error
 
     applied: List[str] = ["parse-and-compile-validation"]
+    skipped: List[str] = []
     if not (
         profile.literal_obfuscation
         or profile.integer_obfuscation
         or profile.local_renaming
         or code_object_hardening
         or vm_obfuscation
+        or cfg_obfuscation
     ):
-        return source, tuple(applied)
-
-    if code_object_hardening:
-        tree = DocstringStripper().visit(tree)  # type: ignore[assignment]
-        ast.fix_missing_locations(tree)
-        applied.append("code-object-docstring-stripping")
+        return SourceTransformResult(source, tuple(applied), tuple(skipped))
 
     used_names = _collect_source_names(tree)
     string_helper = entropy.identifier(used_names)
     integer_helper = entropy.identifier(used_names)
-    vm_helper = entropy.identifier(used_names)
+    protected = _protected_literal_roots(tree, protect_joined_strings=not code_object_hardening)
+    integer_transformer: Optional[IntObfuscator] = None
+    string_transformer: Optional[StringObfuscator] = None
+    vm_transformer: Optional[VMObfuscator] = None
+    cfg_transformer: Optional[ConservativeCFGObfuscator] = None
+    helper_sources: List[str] = []
+
+    def validate(pass_id: str) -> None:
+        ast.fix_missing_locations(tree)
+        try:
+            compile(tree, filename, "exec", dont_inherit=True)
+        except (SyntaxError, ValueError, RecursionError) as error:
+            raise SourceTransformError(
+                "{0} produced an invalid AST: {1}".format(pass_id, error)
+            ) from error
+
+    def run_pass(pass_id: str, operation) -> None:
+        nonlocal tree, protected, helper_sources
+        snapshot_tree = copy.deepcopy(tree)
+        snapshot_protected = set(protected)
+        snapshot_helpers = list(helper_sources)
+        snapshot_applied = list(applied)
+        try:
+            reports = operation()
+            validate(pass_id)
+            applied.extend(reports)
+        except SourceTransformError as error:
+            tree = snapshot_tree
+            protected = snapshot_protected
+            helper_sources = snapshot_helpers
+            applied[:] = snapshot_applied
+            skipped.append("{0}: {1}".format(pass_id, error))
+        except Exception as error:
+            tree = snapshot_tree
+            protected = snapshot_protected
+            helper_sources = snapshot_helpers
+            applied[:] = snapshot_applied
+            skipped.append("{0}: {1}".format(pass_id, error))
+
+    if code_object_hardening:
+        def apply_docstring_stripping() -> Tuple[str, ...]:
+            nonlocal tree
+            tree = DocstringStripper().visit(tree)  # type: ignore[assignment]
+            return ("code-object-docstring-stripping",)
+
+        run_pass("code-object-docstring-stripping", apply_docstring_stripping)
 
     if profile.local_renaming:
-        tree = ConservativeLocalRenamer(entropy, used_names).visit(tree)  # type: ignore[assignment]
-        applied.append("conservative-local-renaming")
+        def apply_local_renaming() -> Tuple[str, ...]:
+            nonlocal tree
+            renamer = ConservativeLocalRenamer(entropy, used_names)
+            tree = renamer.visit(tree)  # type: ignore[assignment]
+            if renamer.renamed_symbols:
+                return (
+                    "scope-aware-local-renaming:{0}-symbols".format(
+                        renamer.renamed_symbols
+                    ),
+                )
+            skipped.append("scope-aware-local-renaming: no statically safe local scopes")
+            return ()
+
+        run_pass("scope-aware-local-renaming", apply_local_renaming)
+
+    if cfg_obfuscation:
+        def apply_cfg_obfuscation() -> Tuple[str, ...]:
+            nonlocal tree, cfg_transformer
+            cfg_transformer = ConservativeCFGObfuscator(entropy, used_names)
+            tree = cfg_transformer.visit(tree)  # type: ignore[assignment]
+            if cfg_transformer.function_count:
+                return (
+                    "conservative-cfg-obfuscation:{0}-functions:{1}-blocks".format(
+                        cfg_transformer.function_count,
+                        cfg_transformer.block_count,
+                    ),
+                )
+            reasons = ",".join(
+                "{0}={1}".format(reason, count)
+                for reason, count in sorted(cfg_transformer.skipped_reasons.items())
+            )
+            skipped.append(
+                "conservative-cfg-obfuscation: no eligible straight-line functions"
+                + (": " + reasons if reasons else "")
+            )
+            return ()
+
+        run_pass("conservative-cfg-obfuscation", apply_cfg_obfuscation)
 
     protected = _protected_literal_roots(
         tree,
         protect_joined_strings=not code_object_hardening,
     )
-    integer_transformer: Optional[IntObfuscator] = None
-    string_transformer: Optional[StringObfuscator] = None
-    vm_transformer: Optional[VMObfuscator] = None
-    helper_sources: List[str] = []
 
     if vm_obfuscation:
-        vm_transformer = VMObfuscator(vm_helper, entropy, protected)
-        tree = vm_transformer.visit(tree)  # type: ignore[assignment]
-        protected.update(vm_transformer.generated_program_roots)
-        helper_sources.append(vm_transformer.helper_source())
+        def apply_vm_obfuscation() -> Tuple[str, ...]:
+            nonlocal tree, protected, vm_transformer
+            vm_transformer = VMObfuscator(entropy, protected, used_names)
+            tree = vm_transformer.visit(tree)  # type: ignore[assignment]
+            protected.update(vm_transformer.generated_program_roots)
+            helper_source = vm_transformer.helper_source()
+            if helper_source:
+                helper_sources.append(helper_source)
+            if not vm_transformer.expression_count:
+                skipped.append("multi-template-vm-obfuscation: no eligible expressions")
+                return ()
+            template_report = ",".join(
+                "{0}={1}".format(kind, count)
+                for kind, count in sorted(vm_transformer.template_counts.items())
+                if count
+            )
+            return (
+                "multi-template-vm-obfuscation:{0}-expressions:{1}-instructions:{2}:{3}".format(
+                    vm_transformer.expression_count,
+                    vm_transformer.instruction_count,
+                    ",".join(sorted(vm_transformer.used_operators)),
+                    template_report,
+                ),
+            )
+
+        run_pass("multi-template-vm-obfuscation", apply_vm_obfuscation)
 
     if profile.integer_obfuscation:
-        integer_transformer = IntObfuscator(integer_helper, entropy, protected)
-        tree = integer_transformer.visit(tree)  # type: ignore[assignment]
-        helper_sources.append(integer_transformer.helper_source())
+        def apply_integer_obfuscation() -> Tuple[str, ...]:
+            nonlocal tree, integer_transformer
+            integer_transformer = IntObfuscator(integer_helper, entropy, protected)
+            tree = integer_transformer.visit(tree)  # type: ignore[assignment]
+            helper_sources.append(integer_transformer.helper_source())
+            if not integer_transformer.integer_count:
+                skipped.append("polymorphic-int-obfuscation: no eligible integer constants")
+                return ()
+            used_strategies = [
+                name
+                for name, count in integer_transformer.strategy_counts.items()
+                if count
+            ]
+            return (
+                "polymorphic-int-obfuscation:{0}:{1}".format(
+                    integer_transformer.integer_count,
+                    ",".join(used_strategies),
+                ),
+            )
+
+        run_pass("polymorphic-int-obfuscation", apply_integer_obfuscation)
 
     if profile.literal_obfuscation:
-        string_transformer = StringObfuscator(string_helper, entropy, protected)
-        tree = string_transformer.visit(tree)  # type: ignore[assignment]
-        helper_sources.append(string_transformer.helper_source())
+        def apply_string_obfuscation() -> Tuple[str, ...]:
+            nonlocal tree, string_transformer
+            string_transformer = StringObfuscator(string_helper, entropy, protected)
+            tree = string_transformer.visit(tree)  # type: ignore[assignment]
+            helper_sources.append(string_transformer.helper_source())
+            if not string_transformer.string_count:
+                skipped.append("polymorphic-string-obfuscation: no eligible string literals")
+                return ()
+            used_string_strategies = [
+                name
+                for name, count in string_transformer.strategy_counts.items()
+                if count
+            ]
+            return (
+                "polymorphic-string-obfuscation:{0}:{1}".format(
+                    string_transformer.string_count,
+                    ",".join(used_string_strategies),
+                ),
+            )
+
+        run_pass("polymorphic-string-obfuscation", apply_string_obfuscation)
 
     helper_source = "\n".join(helper_sources)
-    helper_nodes = ast.parse(helper_source).body
-    insertion_index = _safe_injection_index(tree)
-    tree.body[insertion_index:insertion_index] = helper_nodes
-    ast.fix_missing_locations(tree)
+    if helper_source:
+        helper_nodes = ast.parse(helper_source).body
+        insertion_index = _safe_injection_index(tree)
+        tree.body[insertion_index:insertion_index] = helper_nodes
+        ast.fix_missing_locations(tree)
 
     try:
         transformed = ast.unparse(tree) + "\n"
@@ -1074,40 +1714,10 @@ def transform_source(
     except (SyntaxError, ValueError, RecursionError) as error:
         raise SourceTransformError("Transformed source is invalid: {0}".format(error)) from error
 
-    if string_transformer is not None and string_transformer.string_count:
-        used_string_strategies = [
-            name
-            for name, count in string_transformer.strategy_counts.items()
-            if count
-        ]
-        applied.append(
-            "polymorphic-string-obfuscation:{0}:{1}".format(
-                string_transformer.string_count,
-                ",".join(used_string_strategies),
-            )
-        )
-    if integer_transformer is not None and integer_transformer.integer_count:
-        used_strategies = [
-            name
-            for name, count in integer_transformer.strategy_counts.items()
-            if count
-        ]
-        applied.append(
-            "polymorphic-int-obfuscation:{0}:{1}".format(
-                integer_transformer.integer_count,
-                ",".join(used_strategies),
-            )
-        )
-    if vm_transformer is not None and vm_transformer.expression_count:
-        applied.append(
-            "stack-vm-obfuscation:{0}-expressions:{1}-instructions:{2}".format(
-                vm_transformer.expression_count,
-                vm_transformer.instruction_count,
-                ",".join(sorted(vm_transformer.used_operators)),
-            )
-        )
+    if any(item != "parse-and-compile-validation" for item in applied):
+        applied.append("atomic-pass-rollback-validation")
     applied.append("ast-normalization")
-    return transformed, tuple(applied)
+    return SourceTransformResult(transformed, tuple(applied), tuple(skipped))
 
 
 LOADER_TEMPLATE = r'''#!/usr/bin/env python3
@@ -1331,14 +1941,16 @@ class EkittenObfuscator:
         self.entropy = BuildEntropy(config.seed)
 
     def obfuscate(self, source: str, filename: str = "<ekitten-input>") -> ObfuscationResult:
-        transformed, source_passes = transform_source(
+        source_result = transform_source(
             source,
             self.profile,
             self.entropy,
             filename,
             code_object_hardening=self.config.code_object_hardening,
             vm_obfuscation=self.config.vm_obfuscation,
+            cfg_obfuscation=self.config.cfg_obfuscation,
         )
+        transformed = source_result.source
         transformed_bytes = transformed.encode("utf-8")
         if self.config.runtime_hardening:
             code_object = compile(
@@ -1387,7 +1999,7 @@ class EkittenObfuscator:
             (sys.version_info.major, sys.version_info.minor),
             self.config.anti_tamper,
         )
-        applied = list(source_passes)
+        applied = list(source_result.applied_passes)
         applied.extend(
             (
                 "zlib-compression",
@@ -1424,6 +2036,7 @@ class EkittenObfuscator:
             output_sha256=hashlib.sha256(loader.encode("utf-8")).hexdigest(),
             applied_passes=tuple(applied),
             runtime_mode=runtime_mode,
+            skipped_passes=source_result.skipped_passes,
         )
 
 
@@ -1453,6 +2066,53 @@ def _write_atomic(path: Path, content: str) -> None:
         except OSError:
             pass
         raise
+
+
+def _is_relative_to(path: Path, parent: Path) -> bool:
+    try:
+        path.relative_to(parent)
+    except ValueError:
+        return False
+    return True
+
+
+def obfuscate_file(
+    input_path: Path,
+    output_path: Path,
+    obfuscator: EkittenObfuscator,
+) -> ObfuscationResult:
+    source = _read_python_source(input_path)
+    result = obfuscator.obfuscate(source, input_path.name)
+    _write_atomic(output_path, result.source)
+    return result
+
+
+def obfuscate_package_tree(
+    input_path: Path,
+    output_path: Path,
+    config: ObfuscationConfig,
+) -> List[Tuple[Path, Path, ObfuscationResult]]:
+    input_path = input_path.resolve()
+    output_path = output_path.resolve()
+    if _is_relative_to(output_path, input_path):
+        raise EkittenError("Package output directory must not be inside the input tree")
+    obfuscator = EkittenObfuscator(config)
+    results: List[Tuple[Path, Path, ObfuscationResult]] = []
+    for source_item in sorted(input_path.rglob("*")):
+        relative_item = source_item.relative_to(input_path)
+        destination_item = output_path / relative_item
+        if source_item.is_dir():
+            destination_item.mkdir(parents=True, exist_ok=True)
+            continue
+        if source_item.suffix == ".py":
+            result = obfuscate_file(source_item, destination_item, obfuscator)
+            results.append((source_item, destination_item, result))
+        else:
+            destination_item.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source_item, destination_item)
+    if not results:
+        raise EkittenError("Package tree does not contain Python files: {0}".format(input_path))
+    return results
 
 
 def _run_program(path: Path, arguments: Sequence[str], timeout: float) -> subprocess.CompletedProcess:
@@ -1492,6 +2152,45 @@ def verify_equivalence(
         differences.append("stderr differs")
     if differences:
         raise VerificationError("Differential verification failed: " + ", ".join(differences))
+
+
+def benchmark_equivalence(
+    original: Path,
+    protected: Path,
+    arguments: Sequence[str],
+    timeout: float,
+    repeat: int,
+) -> dict:
+    if repeat < 1:
+        raise EkittenError("Benchmark repeat count must be at least 1")
+
+    def measure(path: Path) -> Tuple[List[float], int]:
+        durations: List[float] = []
+        last_returncode = 0
+        for _ in range(repeat):
+            started = time.perf_counter()
+            completed = _run_program(path, arguments, timeout)
+            durations.append(time.perf_counter() - started)
+            last_returncode = completed.returncode
+        return durations, last_returncode
+
+    original_times, original_returncode = measure(original)
+    protected_times, protected_returncode = measure(protected)
+    original_size = original.stat().st_size
+    protected_size = protected.stat().st_size
+    return {
+        "repeat": repeat,
+        "original_returncode": original_returncode,
+        "protected_returncode": protected_returncode,
+        "original_size_bytes": original_size,
+        "protected_size_bytes": protected_size,
+        "size_ratio": protected_size / max(original_size, 1),
+        "original_median_seconds": sorted(original_times)[len(original_times) // 2],
+        "protected_median_seconds": sorted(protected_times)[len(protected_times) // 2],
+        "original_worst_seconds": max(original_times),
+        "protected_worst_seconds": max(protected_times),
+        "memory_peak_bytes": None,
+    }
 
 
 def run_self_test() -> None:
@@ -1666,7 +2365,7 @@ print(calculate())
         )
     ).obfuscate(sample_source, "<self-test-vm>")
     if not any(
-        item.startswith("stack-vm-obfuscation:")
+        item.startswith("multi-template-vm-obfuscation:")
         for item in vm_result.applied_passes
     ):
         raise EkittenError("VM obfuscation did not virtualize test expressions")
@@ -1681,6 +2380,76 @@ print(calculate())
         vm_namespace,
         vm_namespace,
     )
+
+    cfg_source = """def route(value):
+    first = value + 2
+    second = first * 5
+    return second - value
+"""
+    cfg_result = EkittenObfuscator(
+        ObfuscationConfig(
+            profile="compatible",
+            seed=112233,
+            cfg_obfuscation=True,
+        )
+    ).obfuscate(cfg_source, "<self-test-cfg>")
+    if not any(
+        item.startswith("conservative-cfg-obfuscation:")
+        for item in cfg_result.applied_passes
+    ):
+        raise EkittenError("CFG obfuscation did not virtualize test function")
+    cfg_namespace = {"__name__": "__main__"}
+    exec(
+        compile(
+            cfg_result.source,
+            "<self-test-cfg-loader>",
+            "exec",
+            dont_inherit=True,
+        ),
+        cfg_namespace,
+        cfg_namespace,
+    )
+    if cfg_namespace["route"](4) != 26:
+        raise EkittenError("CFG obfuscation changed function semantics")
+
+    with tempfile.TemporaryDirectory(prefix="ekitten-package-self-test-") as temporary_dir:
+        root = Path(temporary_dir)
+        source_parent = root / "source"
+        protected_parent = root / "protected"
+        package_input = source_parent / "samplepkg"
+        package_output = protected_parent / "samplepkg"
+        package_input.mkdir(parents=True)
+        _write_atomic(package_input / "__init__.py", "NAME = 'samplepkg'\n")
+        _write_atomic(
+            package_input / "worker.py",
+            "def value():\n    return 40 + 2\n",
+        )
+        _write_atomic(package_input / "data.txt", "resource-ok\n")
+        _write_atomic(
+            package_input / "__main__.py",
+            "from importlib.resources import files\n"
+            "from .worker import value\n"
+            "print(str(value()) + ':' + files(__package__).joinpath('data.txt').read_text(encoding='utf-8').strip())\n",
+        )
+        obfuscate_package_tree(
+            package_input,
+            package_output,
+            ObfuscationConfig(profile="compatible", seed=445566),
+        )
+        package_process = subprocess.run(
+            [sys.executable, "-m", "samplepkg"],
+            cwd=str(protected_parent),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=10.0,
+            check=False,
+        )
+        if package_process.returncode != 0 or package_process.stdout.strip() != b"42:resource-ok":
+            raise EkittenError(
+                "Package tree self-test failed: {0}".format(
+                    package_process.stderr.decode("utf-8", errors="replace")
+                )
+            )
 
     anti_tamper_result = EkittenObfuscator(
         ObfuscationConfig(
@@ -1802,12 +2571,17 @@ def _manifest(result: ObfuscationResult, input_path: Path, output_path: Path) ->
         "transformed_sha256": result.transformed_sha256,
         "output_sha256": result.output_sha256,
         "applied_passes": list(result.applied_passes),
+        "skipped_passes": list(result.skipped_passes),
         "runtime_mode": result.runtime_mode,
         "code_object_hardening": result.runtime_mode.startswith(
             "hardened-code-object-"
         ),
         "vm_obfuscation": any(
-            item.startswith("stack-vm-obfuscation:")
+            item.startswith("multi-template-vm-obfuscation:")
+            for item in result.applied_passes
+        ),
+        "cfg_obfuscation": any(
+            item.startswith("conservative-cfg-obfuscation:")
             for item in result.applied_passes
         ),
         "anti_tamper": "full-artifact-canonical-sha256-seal"
@@ -1820,6 +2594,53 @@ def _manifest(result: ObfuscationResult, input_path: Path, output_path: Path) ->
     }
 
 
+def _package_manifest(
+    results: Sequence[Tuple[Path, Path, ObfuscationResult]],
+    input_path: Path,
+    output_path: Path,
+    config: ObfuscationConfig,
+) -> dict:
+    aggregate = hashlib.sha256()
+    modules = []
+    applied: Set[str] = set()
+    skipped: Set[str] = set()
+    for source_path, destination_path, result in results:
+        aggregate.update(str(source_path.relative_to(input_path)).encode("utf-8"))
+        aggregate.update(result.output_sha256.encode("ascii"))
+        applied.update(result.applied_passes)
+        skipped.update(result.skipped_passes)
+        modules.append(
+            {
+                "input": str(source_path),
+                "output": str(destination_path),
+                "source_sha256": result.source_sha256,
+                "transformed_sha256": result.transformed_sha256,
+                "output_sha256": result.output_sha256,
+                "applied_passes": list(result.applied_passes),
+                "skipped_passes": list(result.skipped_passes),
+                "runtime_mode": result.runtime_mode,
+            }
+        )
+    return {
+        "tool": "Ekitten Final",
+        "version": __version__,
+        "input": str(input_path),
+        "output": str(output_path),
+        "package_tree": True,
+        "modules": modules,
+        "module_count": len(modules),
+        "profile": config.profile,
+        "aggregate_output_sha256": aggregate.hexdigest(),
+        "applied_passes": sorted(applied),
+        "skipped_passes": sorted(skipped),
+        "python_build_abi": "{0}.{1}".format(
+            sys.version_info.major,
+            sys.version_info.minor,
+        ),
+        "aes_used": False,
+    }
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
@@ -1827,8 +2648,8 @@ def build_parser() -> argparse.ArgumentParser:
             "authenticated BlazingOpossum payload."
         )
     )
-    parser.add_argument("input", nargs="?", type=Path, help="Python source file")
-    parser.add_argument("-o", "--output", type=Path, help="Generated Python file")
+    parser.add_argument("input", nargs="?", type=Path, help="Python source file or package directory")
+    parser.add_argument("-o", "--output", type=Path, help="Generated Python file or package directory")
     parser.add_argument(
         "--profile",
         choices=tuple(PROFILES),
@@ -1865,8 +2686,16 @@ def build_parser() -> argparse.ArgumentParser:
         "--vm-obfuscation",
         action="store_true",
         help=(
-            "Virtualize conservative arithmetic expression trees in a "
-            "polymorphic stack VM"
+            "Virtualize conservative arithmetic expression trees with "
+            "per-scope polymorphic VM templates"
+        ),
+    )
+    parser.add_argument(
+        "--cfg-obfuscation",
+        action="store_true",
+        help=(
+            "Virtualize tiny straight-line function bodies with a conservative "
+            "state dispatcher"
         ),
     )
     parser.add_argument(
@@ -1886,6 +2715,17 @@ def build_parser() -> argparse.ArgumentParser:
         "--verify",
         action="store_true",
         help="Run original and generated scripts and compare exit/stdout/stderr",
+    )
+    parser.add_argument(
+        "--benchmark",
+        action="store_true",
+        help="Measure subprocess runtime and output size for original/protected files",
+    )
+    parser.add_argument(
+        "--benchmark-repeat",
+        type=int,
+        default=5,
+        help="Benchmark repetitions per file (default: 5)",
     )
     parser.add_argument(
         "--verify-arg",
@@ -1920,17 +2760,20 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             parser.error("input is required unless --self-test is used")
 
         input_path = arguments.input.resolve()
-        if not input_path.is_file():
-            raise EkittenError("Input file does not exist: {0}".format(input_path))
+        if not input_path.exists():
+            raise EkittenError("Input path does not exist: {0}".format(input_path))
         output_path = (
             arguments.output.resolve()
             if arguments.output is not None
-            else input_path.with_name(input_path.stem + "-ekitten.py")
+            else (
+                input_path.with_name(input_path.name + "-ekitten")
+                if input_path.is_dir()
+                else input_path.with_name(input_path.stem + "-ekitten.py")
+            )
         )
         if input_path == output_path:
             raise EkittenError("Input and output paths must be different")
 
-        source = _read_python_source(input_path)
         config = ObfuscationConfig(
             profile=arguments.profile,
             seed=arguments.seed,
@@ -1938,10 +2781,38 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             runtime_hardening=arguments.runtime_hardening,
             code_object_hardening=arguments.code_object_hardening,
             vm_obfuscation=arguments.vm_obfuscation,
+            cfg_obfuscation=arguments.cfg_obfuscation,
             anti_tamper=arguments.anti_tamper,
         )
-        result = EkittenObfuscator(config).obfuscate(source, input_path.name)
-        _write_atomic(output_path, result.source)
+        if input_path.is_dir():
+            if arguments.verify or arguments.benchmark:
+                raise EkittenError(
+                    "--verify/--benchmark for package trees requires an explicit fixture; "
+                    "run the generated package entry point separately"
+                )
+            package_results = obfuscate_package_tree(input_path, output_path, config)
+            if arguments.manifest is not None:
+                manifest_path = arguments.manifest.resolve()
+                manifest_text = json.dumps(
+                    _package_manifest(
+                        package_results,
+                        input_path,
+                        output_path,
+                        config,
+                    ),
+                    indent=2,
+                    sort_keys=True,
+                ) + "\n"
+                _write_atomic(manifest_path, manifest_text)
+            print("Protected package tree: {0}".format(output_path))
+            print("Python modules protected: {0}".format(len(package_results)))
+            print("Profile: {0}".format(config.resolved_profile().name))
+            return 0
+
+        if not input_path.is_file():
+            raise EkittenError("Input is neither a file nor a directory: {0}".format(input_path))
+
+        result = obfuscate_file(input_path, output_path, EkittenObfuscator(config))
 
         if arguments.manifest is not None:
             manifest_path = arguments.manifest.resolve()
@@ -1959,6 +2830,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 arguments.verify_arg,
                 arguments.timeout,
             )
+        if arguments.benchmark:
+            benchmark = benchmark_equivalence(
+                input_path,
+                output_path,
+                arguments.verify_arg,
+                arguments.timeout,
+                arguments.benchmark_repeat,
+            )
 
         print("Protected file: {0}".format(output_path))
         print("Profile: {0}; BlazingOpossum layers: {1}".format(
@@ -1968,6 +2847,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print("Output SHA-256: {0}".format(result.output_sha256))
         if arguments.verify:
             print("Differential verification: OK")
+        if arguments.benchmark:
+            print(
+                "Benchmark median seconds: original={0:.6f}; protected={1:.6f}; size_ratio={2:.2f}x".format(
+                    benchmark["original_median_seconds"],
+                    benchmark["protected_median_seconds"],
+                    benchmark["size_ratio"],
+                )
+            )
         return 0
     except (EkittenError, OSError, subprocess.SubprocessError) as error:
         print("Ekitten Final error: {0}".format(error), file=sys.stderr)

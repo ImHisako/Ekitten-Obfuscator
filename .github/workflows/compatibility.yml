@@ -1,0 +1,53 @@
+name: compatibility
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  cpython:
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version:
+          - "3.9"
+          - "3.10"
+          - "3.11"
+          - "3.12"
+          - "3.13"
+          - "3.14"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Compile obfuscator
+        run: python -m py_compile "Ekitten Obfuscator.py"
+
+      - name: Self-test obfuscator
+        run: python "Ekitten Obfuscator.py" --self-test
+
+      - name: Compile compatibility fixture
+        if: ${{ matrix.python-version != '3.9' }}
+        run: python -m py_compile test.py
+
+      - name: Run compatibility fixture
+        if: ${{ matrix.python-version != '3.9' }}
+        run: python test.py
+
+      - name: Differential test compatible profile
+        if: ${{ matrix.python-version != '3.9' }}
+        run: python "Ekitten Obfuscator.py" test.py -o test-compatible.py --profile compatible --verify
+
+      - name: Differential test balanced profile
+        if: ${{ matrix.python-version != '3.9' }}
+        run: python "Ekitten Obfuscator.py" test.py -o test-balanced.py --profile balanced --verify
+
+      - name: Differential test maximum hardened profile
+        if: ${{ matrix.python-version != '3.9' }}
+        run: python "Ekitten Obfuscator.py" test.py -o test-maximum-all.py --profile maximum --runtime-hardening --code-object-hardening --vm-obfuscation --cfg-obfuscation --anti-tamper --verify --verify-arg=--allow-stripped-docstrings

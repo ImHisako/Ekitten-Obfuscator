@@ -310,6 +310,12 @@ def assignment_expression_case(values: list[int]) -> int:
     return 0
 
 
+def cfg_linear_case(value: int) -> int:
+    first = value + 2
+    second = first * 3
+    return second - value
+
+
 def vm_operations_case(left: int, right: int, flag: bool) -> tuple[Any, ...]:
     return (
         left + right,
@@ -339,7 +345,7 @@ def run_compatibility_suite(check_docstring: bool = True) -> dict[str, Any]:
     checks = CheckBook()
 
     if check_docstring:
-        checks.equal("module-docstring", __doc__.splitlines()[0], "Ekitten Final differential compatibility fixture.")
+        checks.equal("module-docstring", __doc__.splitlines()[0], "Ekitten Obfuscator differential compatibility fixture.")
     checks.equal("unicode", UNICODE_TEXT, "gattino-è-東京-🐈")
     checks.equal(
         "string-boundaries",
@@ -443,6 +449,7 @@ def run_compatibility_suite(check_docstring: bool = True) -> dict[str, Any]:
     increment = lambda value: value + 1
     checks.equal("lambda", increment(8), 9)
     checks.equal("assignment-expression", assignment_expression_case([1, 2, 3]), 3)
+    checks.equal("cfg-linear", cfg_linear_case(5), 16)
     checks.equal(
         "vm-operators",
         vm_operations_case(7, 2, True),
