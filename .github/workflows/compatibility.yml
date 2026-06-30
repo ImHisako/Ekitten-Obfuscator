@@ -34,20 +34,20 @@ jobs:
 
       - name: Compile compatibility fixture
         if: ${{ matrix.python-version != '3.9' }}
-        run: python -m py_compile test.py
+        run: python -m py_compile Ekitten-Tester.py
 
       - name: Run compatibility fixture
         if: ${{ matrix.python-version != '3.9' }}
-        run: python test.py
+        run: python Ekitten-Tester.py
 
       - name: Differential test compatible profile
         if: ${{ matrix.python-version != '3.9' }}
-        run: python "Ekitten Obfuscator.py" test.py -o test-compatible.py --profile compatible --verify
+        run: python "Ekitten Obfuscator.py" Ekitten-Tester.py -o test-compatible.py --profile compatible --verify
 
       - name: Differential test balanced profile
         if: ${{ matrix.python-version != '3.9' }}
-        run: python "Ekitten Obfuscator.py" test.py -o test-balanced.py --profile balanced --verify
+        run: python "Ekitten Obfuscator.py" Ekitten-Tester.py -o test-balanced.py --profile balanced --verify
 
       - name: Differential test maximum hardened profile
         if: ${{ matrix.python-version != '3.9' }}
-        run: python "Ekitten Obfuscator.py" test.py -o test-maximum-all.py --profile maximum --runtime-hardening --code-object-hardening --vm-obfuscation --cfg-obfuscation --anti-tamper --verify --verify-arg=--allow-stripped-docstrings
+        run: python "Ekitten Obfuscator.py" Ekitten-Tester.py -o test-maximum-all.py --profile maximum --runtime-hardening --code-object-hardening --vm-obfuscation --cfg-obfuscation --anti-tamper --verify --verify-arg=--allow-stripped-docstrings
