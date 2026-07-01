@@ -16,7 +16,7 @@ Il progetto non usa AES. Il loader generato dipende esclusivamente dalla libreri
 - Da 1 a 12 round BlazingOpossum configurabili.
 - Tag di integrità verificato prima di decifrare ogni round.
 - `IntObfuscator` AST polimorfico con sei strategie aritmetiche e bitwise.
-- `StringObfuscator` UTF-8 polimorfico con sei strategie byte-safe.
+- `StringObfuscator` UTF-8 polimorfico con otto strategie byte-safe.
 - Decodifica lazy delle stringhe al punto d'uso, con azzeramento best-effort dei buffer temporanei mutabili.
 - Rinomina scope-aware delle variabili locali nei soli scope considerati sicuri, con skip conservativo per reflection, closure ambigue, `global`, `nonlocal`, pickle e API pubbliche.
 - Pipeline sorgente a pass atomiche: ogni pass viene compilata dopo l'applicazione e viene ripristinata se fallisce, con motivazione nel manifest.
@@ -31,19 +31,21 @@ Il progetto non usa AES. Il loader generato dipende esclusivamente dalla libreri
 - VM per scope/funzione con opcode casuali e template diversi: stack VM, register VM e dispatcher a tabella.
 - CFG obfuscation opzionale per piccole funzioni lineari tramite dispatcher a stato, saltando automaticamente `try`, `yield`, `await`, chiamate e costrutti sensibili.
 - Supporto directory/package: offusca ricorsivamente i file `.py`, copia le risorse e conserva import relativi ed entry point `python -m package`.
+- Packaging opzionale con Nuitka per file singoli già offuscati quando la toolchain è compatibile; CPython 3.13 è escluso in questa release.
 - Sigillo SHA-256 canonico dell’intero artefatto verificato prima della decifratura.
 - Azzeramento best-effort dei buffer mutabili contenenti chiavi, payload compresso e dati serializzati.
 - Build casuali per impostazione predefinita o riproducibili tramite `--seed`.
 - Manifest JSON opzionale senza plaintext o chiavi ricostruite.
 - Verifica differenziale automatica tra programma originale e programma protetto.
 - Benchmark leggero per file singoli: dimensione output e tempi subprocess originale/protetto.
-- Nessuna dipendenza Python esterna.
+- Nessuna dipendenza Python esterna per l'obfuscation core; Nuitka è una dipendenza opzionale solo quando si usa `--nuitka`.
 
 ## Requisiti
 
 - CPython 3.10 o successivo è raccomandato.
 - Lo sviluppo corrente è stato verificato con CPython 3.10 e 3.13.
 - Il file o package da proteggere deve essere sintatticamente valido per la versione Python usata durante la build.
+- Per `--nuitka`, installare Nuitka nello stesso interprete usato per la build compatibile, ad esempio `py -3.12 -m pip install nuitka`.
 
 Il supporto package lavora su directory sorgente reali: copia risorse non-Python e offusca ogni modulo `.py`. Non genera wheel, metadata di distribuzione o bundle di estensioni native.
 
@@ -91,22 +93,22 @@ py -3.13 ".\Ekitten Final.py" ".\programma.py" `
 ```
 
 ```powershell
-py -3.13 ".\Ekitten Final.py" ".\Ekitten-Tester.py" --output ".\programma-protetto.py" --profile maximum --layers 8 --runtime-hardening --code-object-hardening --vm-obfuscation --cfg-obfuscation --anti-tamper --verify   --benchmark --manifest ".\programma.manifest.json
+py -3.13 ".\Ekitten Final.py" ".\Ekitten-Tester.py" --output ".\programma-protetto.py" --profile maximum --layers 8 --runtime-hardening --code-object-hardening --vm-obfuscation --cfg-obfuscation --anti-tamper --verify --verify-arg=--allow-stripped-docstrings --benchmark --manifest ".\programma.manifest.json"
 ```
 
-Per librerie o CLI che espongono docstring, filename, numeri di riga o `inspect`, rimuovere `--code-object-hardening`. Per codice non deterministico, usare una fixture di verifica dedicata invece di `--verify` semplice.
+Per librerie o CLI che espongono docstring, filename, numeri di riga o `inspect`, rimuovere `--code-object-hardening`. Per fixture che osservano metadata poi rimossi, usare aspettative dedicate come `--verify-arg=--allow-stripped-docstrings` in `Ekitten-Tester.py`. Per codice non deterministico, usare una fixture di verifica dedicata invece di `--verify` semplice.
 
 Build riproducibile con manifest:
 
 ```powershell
-py -3.13 ".\Ekitten Final.py" ".\programma.py" `
+py -3.13 ".\Ekitten Final.py" ".\Ekitten-Tester.py" `
   --profile balanced `
   --seed 2026 `
   --manifest ".\programma.manifest.json"
 ```
 
 ```powershell
-py -3.13 ".\Ekitten Final.py" ".\programma.py" --profile balanced --seed 2026 --manifest ".\programma.manifest.json"
+py -3.13 ".\Ekitten Final.py" ".\Ekitten-Tester.py" --profile balanced --seed 2026 --manifest ".\programma.manifest.json"
 ```
 
 Package directory con import relativi, risorse e `python -m package`:
@@ -127,12 +129,30 @@ py -3.13 ".\Ekitten Final.py" ".\mio_package" --output ".\dist\mio_package" --pr
 Protezione runtime rafforzata, vincolata alla minor version Python usata per la build:
 
 ```powershell
-py -3.13 ".\Ekitten Final.py" ".\programma.py" `
+py -3.13 ".\Ekitten Final.py" ".\Ekitten-Tester.py" `
   --output ".\programma-hardened.py" `
   --profile maximum `
   --runtime-hardening `
   --verify
 ```
+
+Packaging opzionale con Nuitka dopo la verifica dell'output Python:
+
+```powershell
+py -3.12 ".\Ekitten Final.py" ".\Ekitten-Tester.py" `
+  --output ".\programma-protetto.py" `
+  --profile maximum `
+  --nuitka `
+  --nuitka-mode accelerated `
+  --verify `
+  --manifest ".\programma-nuitka.manifest.json"
+```
+
+```powershell
+py -3.12 ".\Ekitten Final.py" ".\Ekitten-Tester.py" --output ".\programma-protetto.py" --profile maximum --nuitka --nuitka-mode accelerated --verify --manifest ".\programma-nuitka.manifest.json"
+```
+
+Questa fase richiede una toolchain Nuitka compatibile. Su CPython 3.13 il packaging Nuitka è disabilitato in questa release; generare prima il `.py` protetto con 3.13, oppure usare CPython 3.12 per la fase Nuitka.
 
 Visualizzare tutti gli argomenti:
 
@@ -174,14 +194,16 @@ Quando l’analisi non è sufficientemente sicura, la funzione viene lasciata in
 
 ### 3. `StringObfuscator` polimorfico
 
-Nei profili `balanced` e `maximum`, le stringhe utilizzabili come normali espressioni vengono codificate in byte UTF-8 e ricostruite da un helper con nome casuale. Ogni stringa sceglie separatamente una delle sei strategie:
+Nei profili `balanced` e `maximum`, le stringhe utilizzabili come normali espressioni vengono codificate in byte UTF-8 e ricostruite da un helper con nome casuale. Ogni stringa sceglie separatamente una delle otto strategie:
 
 - somma progressiva con chiave e indice;
 - XOR progressivo con rolling key;
 - inversione dell’ordine combinata con XOR;
 - rotazione degli 8 bit combinata con XOR;
 - trasformazione affine invertibile modulo 256;
-- separazione byte pari/dispari con rolling XOR.
+- separazione byte pari/dispari con rolling XOR;
+- catena carry-dependent con chiave e indice;
+- nibble swap combinato con XOR indicizzato.
 
 Ogni strategia usa un token casuale differente per build e l’ordine dei branch del decoder viene permutato. La trasformazione opera sui byte, quindi conserva Unicode, caratteri null, newline, tab, slash e stringhe molto lunghe.
 
@@ -330,6 +352,8 @@ I decoy aumentano il rumore statico senza introdurre side effect o dead code ese
 
 Funzioni, alias degli import e variabili del bootstrap ricevono identificatori casuali validi. Due build senza seed producono strutture e payload differenti; due build con stesso input, stessa versione, stesso profilo e stesso seed producono byte identici.
 
+I nomi dei moduli standard usati dal bootstrap (`base64`, `zlib`, `marshal`, ecc.) non vengono più dichiarati in una singola istruzione `import` leggibile: il loader contiene una piccola tabella XOR per-build e ricostruisce i nomi subito prima di importarli. Questa è una barriera contro pattern statici banali, non una garanzia di segretezza: un analista runtime può comunque osservare i moduli caricati.
+
 ### 14. Bootstrap isolato, guard runtime ed esecuzione senza `exec`
 
 Il loader esegue tutta la ricostruzione dentro una funzione. Poco prima di eseguire il programma originale rimuove il nome della funzione bootstrap dai global.
@@ -414,6 +438,29 @@ Come ogni controllo self-contained, un reverse engineer può rimuovere sia verif
 
 Le firme digitali con chiave privata esterna non sono ancora implementate perché la libreria standard non offre Ed25519/RSA-PSS ad alto livello e il progetto evita primitive crittografiche custom. Il passo corretto è introdurre una dipendenza mantenuta, per esempio `cryptography`, mantenendo solo la chiave pubblica nel loader e firmando fuori dall’artefatto distribuito.
 
+### Packaging Nuitka opzionale
+
+Con `--nuitka`, Ekitten scrive prima il file Python protetto e poi invoca Nuitka come fase separata di packaging. Il comando usa l'interprete scelto con `--nuitka-python`, oppure l'interprete corrente, nella forma:
+
+```text
+<python> -m nuitka --output-dir=<dir> [mode/options] programma-protetto.py
+```
+
+Limitazione importante: il packaging Nuitka è disabilitato quando Ekitten gira su CPython 3.13. Con Nuitka 4.1.3 su Python 3.13, i build che eseguono dynamic code object possono terminare con `SystemError: ... codeobject.c ... bad argument to internal function`, anche su smoke test minimali. Usare CPython 3.12 per questa fase oppure distribuire il `.py` protetto senza Nuitka.
+
+Modalità previste quando la toolchain è compatibile:
+
+- `accelerated`: non aggiunge né `--standalone` né `--onefile`, utile per prove locali e build più rapide.
+- `standalone` e `onefile`: non sono abilitati per il loader runtime dinamico in questa release; usarli soltanto dopo una verifica esplicita della toolchain e aspettarsi che `--verify` blocchi eventuali incompatibilità.
+
+Usare `--nuitka-option=...` per passare opzioni specifiche di progetto, per esempio data files, plugin o icone. Le opzioni vanno passate nella forma completa con `=`, ad esempio `--nuitka-option=--include-data-dir=assets=assets`.
+
+Prima della build Ekitten esegue un probe leggero con `<python> -m nuitka --version`. Su alcune installazioni Windows il primo avvio può essere lento per cache, antivirus o toolchain: aumentare `--nuitka-probe-timeout` se il probe scade prima della build reale.
+
+Se `--verify` è attivo, Ekitten verifica prima originale contro file Python protetto e, dopo la compilazione, originale contro eseguibile Nuitka. Il manifest include modalità, comando, versione Nuitka, percorso dell'eseguibile e SHA-256 del binario.
+
+`--nuitka` non è compatibile con `--anti-tamper`: il sigillo anti-tamper verifica il testo del file Python generato, mentre Nuitka lo trasforma in un artefatto binario. Per integrità del binario serve una firma esterna del file prodotto o del pacchetto di distribuzione.
+
 ## Riepilogo del flusso
 
 ```text
@@ -434,9 +481,12 @@ Payload compresso
 Ciphertext finale
     ↓ key splitting + Base85 + permutazione + decoy
 Loader Python autonomo
+    ↓ tabella import XOR per-build
     ↓ sigillo completo anti-tamper opzionale
     ↓ guard runtime + buffer wipe best-effort
 Code object eseguito via FunctionType, senza exec
+    ↓ opzionale: Nuitka accelerated su toolchain compatibile
+Artefatto binario o directory Nuitka
 ```
 
 ## Riferimento CLI
@@ -448,7 +498,13 @@ usage: Ekitten Final.py [-h] [-o OUTPUT]
                         [--runtime-hardening]
                         [--code-object-hardening]
                         [--vm-obfuscation] [--cfg-obfuscation]
-                        [--anti-tamper]
+                        [--anti-tamper] [--nuitka]
+                        [--nuitka-mode {standalone,onefile,accelerated}]
+                        [--nuitka-output-dir NUITKA_OUTPUT_DIR]
+                        [--nuitka-python NUITKA_PYTHON]
+                        [--nuitka-option NUITKA_OPTION]
+                        [--nuitka-timeout NUITKA_TIMEOUT]
+                        [--nuitka-probe-timeout NUITKA_PROBE_TIMEOUT]
                         [--manifest MANIFEST] [--verify] [--benchmark]
                         [--benchmark-repeat N]
                         [--verify-arg VALUE] [--timeout SECONDS]
@@ -468,6 +524,13 @@ usage: Ekitten Final.py [-h] [-o OUTPUT]
 - `--vm-obfuscation`: converte espressioni aritmetiche conservative in bytecode per VM per-scope con template stack, register o table-dispatch.
 - `--cfg-obfuscation`: converte piccole funzioni lineari in dispatcher a stato; salta automaticamente costrutti sensibili.
 - `--anti-tamper`: sigilla tutto il file generato e lo verifica prima della decifratura; richiede esecuzione file-backed.
+- `--nuitka`: compila il file Python protetto con Nuitka dopo obfuscation ed eventuale verifica del file `.py`.
+- `--nuitka-mode`: modalità Nuitka, una tra `standalone`, `onefile` e `accelerated`; il default è `accelerated`, mentre `standalone` e `onefile` sono bloccati per il loader dinamico in questa release.
+- `--nuitka-output-dir`: directory degli artefatti Nuitka; default accanto all'output come `NOME-nuitka`.
+- `--nuitka-python`: interprete Python usato per eseguire `-m nuitka`; default interprete corrente.
+- `--nuitka-option`: opzione Nuitka extra in forma completa; ripetibile.
+- `--nuitka-timeout`: timeout della build Nuitka in secondi.
+- `--nuitka-probe-timeout`: timeout del controllo preliminare `python -m nuitka --version`.
 - `--manifest`: scrive metadata e hash della build in JSON.
 - `--verify`: esegue originale e output e confronta exit code, stdout e stderr.
 - `--benchmark`: misura tempi subprocess e dimensione per file singoli.
@@ -486,7 +549,7 @@ py -3.13 ".\Ekitten Final.py" ".\programma.py" `
 
 ## Verifica differenziale
 
-`--verify` avvia due subprocess separati con lo stesso interprete, working directory, argomenti e `PYTHONHASHSEED=0`. La verifica passa soltanto se coincidono:
+`--verify` avvia due subprocess separati con lo stesso interprete, working directory, argomenti e `PYTHONHASHSEED=0`. Con `--nuitka`, dopo la build viene eseguito anche un confronto tra originale e binario Nuitka. La verifica passa soltanto se coincidono:
 
 - codice di uscita;
 - stdout in byte;
@@ -496,7 +559,7 @@ La verifica esegue realmente entrambi i file. Va usata esclusivamente con sorgen
 
 ## Benchmark
 
-`--benchmark` esegue originale e output in subprocess e riporta tempi mediani, caso peggiore e rapporto dimensionale. Usa gli stessi `--verify-arg` e `--timeout` della verifica differenziale:
+`--benchmark` esegue originale e output Python protetto in subprocess e riporta tempi mediani, caso peggiore e rapporto dimensionale. Usa gli stessi `--verify-arg` e `--timeout` della verifica differenziale:
 
 ```powershell
 py -3.13 ".\Ekitten Final.py" ".\programma.py" `
@@ -598,7 +661,9 @@ Il self-test controlla:
 - round-trip BlazingOpossum su payload di varie dimensioni;
 - rifiuto di un ciphertext alterato;
 - round-trip di tutte le sei strategie dell’`IntObfuscator`, inclusi valori negativi e interi da oltre 64 bit;
-- round-trip di tutte le sei strategie dello `StringObfuscator` su ASCII, Unicode, null e stringhe lunghe;
+- round-trip di tutte le otto strategie dello `StringObfuscator` su ASCII, Unicode, null e stringhe lunghe;
+- riproducibilità byte-identica con seed fisso e differenza strutturale con seed diverso;
+- applicazione della tabella import XOR nel loader e registrazione della pass nel report;
 - generazione ed esecuzione dei profili `compatible`, `balanced` e `maximum`.
 - generazione ed esecuzione di un payload `maximum --runtime-hardening`.
 - generazione ed esecuzione della modalità code-object hardened con docstring rimosse e metadata sanitizzati.
@@ -621,11 +686,16 @@ La workflow `.github/workflows/compatibility.yml` esegue `--self-test` su CPytho
 - La rinomina non tenta di coprire ogni nome. Saltare uno scope ambiguo è una scelta deliberata di compatibilità.
 - Il loader portabile usa `compile()` dopo averne verificato l’identità, ma non usa `exec()`.
 - Il loader hardened non usa né `compile()` né `exec()` a runtime, ma `marshal` lo vincola esattamente alla minor version CPython della build.
+- La tabella XOR degli import nasconde pattern statici immediati, ma i nomi vengono necessariamente ricostruiti a runtime e non devono essere trattati come segreti.
 - `--code-object-hardening` imposta `__doc__` a `None`, riduce le informazioni dei traceback e non è semanticamente trasparente per programmi che osservano questi metadata.
 - La VM copre espressioni aritmetiche sicure, non ogni istruzione Python; aumenta dimensione e overhead runtime.
 - La CFG obfuscation copre solo funzioni brevi e lineari. Se trova `try`, `yield`, `await`, chiamate o costrutti sensibili, salta la funzione e registra il motivo nel manifest.
 - Il sigillo anti-tamper considera anche newline e commenti: formatter, editor o sistemi che riscrivono il file ne causano correttamente il rifiuto.
 - Il supporto package copia risorse e moduli `.py`, ma non crea wheel, metadata di distribuzione o bundle di estensioni native.
+- `--nuitka` supporta solo input file singoli in questa versione; per package complessi compilare un entry point esplicito dopo aver generato il package protetto.
+- `--nuitka` e `--anti-tamper` sono incompatibili perché il sigillo anti-tamper verifica il testo del loader Python generato.
+- Nuitka non include automaticamente ogni file dati usato a runtime: usare `--nuitka-option=--include-data-dir=SRC=DST` o le opzioni Nuitka appropriate.
+- Il self-test non esegue una build Nuitka perché dipende da installazione, compilatore C e toolchain locali.
 - Moduli C e dipendenze esterne non vengono inclusi automaticamente.
 - Le firme digitali con chiave privata esterna sono una feature pianificata, non ancora presente: il sigillo attuale è integrità self-contained, non autenticità esterna.
 - Codice che legge o modifica il proprio file vedrà il loader, non il sorgente originale.
@@ -646,6 +716,7 @@ Ekitten Final è adatto a rendere più costose:
 - recupero immediato del sorgente nella modalità hardened, dove il testo non viene ricostruito a runtime.
 - dump immediatamente leggibili di docstring, filename, line table e literal di f-string nella modalità code-object hardened.
 - patch non coordinate del loader o del payload quando il sigillo completo è attivo;
+- riconoscimento statico immediato del bootstrap tramite una singola istruzione `import base64, zlib, marshal, ...`;
 - riconoscimento statico immediato delle espressioni virtualizzate grazie agli opcode polimorfici per funzione.
 
 Non garantisce protezione assoluta contro:
